@@ -1,0 +1,155 @@
+#!/data/data/com.termux/files/usr/bin/bash
+__version__="1.0"
+
+# Colors
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
+
+# Colored echo helpers
+green_echo() { echo -e "${GREEN}$1${RESET}"; }
+red_echo() { echo -e "${RED}$1${RESET}"; }
+
+# Graceful exit on Ctrl+C
+trap 'red_echo "[!] Script interrupted."; exit 1' SIGINT
+
+# Banner
+banner() {
+  green_echo "=========================================="
+  green_echo " Termux Cloudflared + PHP Installer v${__version__}"
+  green_echo "=========================================="
+}
+
+# 1) Update and upgrade packages
+termux_update() {
+  green_echo "[+] Updating Termux packages..."
+  yes | pkg update
+  yes | pkg upgrade
+}
+
+# 2) Install dependencies: php, curl, jq
+install_dependencies() {
+  local packages=(php curl jq)
+  for p in "${packages[@]}"; do
+    if ! command -v "$p" &>/dev/null; then
+      green_echo "[+] Installing $p..."
+      yes | pkg install "$p"
+    fi
+  done
+  green_echo "[+] All dependencies installed."
+}
+
+# 3) Kill any existing php/cloudflared
+kill_existing() {
+  local procs=(php cloudflared)
+  for prc in "${procs[@]}"; do
+    if pgrep "$prc" &>/dev/null; then
+      green_echo "[ - ] Killing existing $prc..."
+      pkill "$prc"
+    fi
+  done
+}
+
+# 4) Download the correct cloudflared for the detected arch
+download_cloudflared() {
+  mkdir -p .server
+  cd .server || exit 1
+
+  green_echo "[ - ] Downloading cloudflared for your architecture..."
+  local arch=$(uname -m)
+  local url=""
+  case "$arch" in
+    arm|armv7l)
+      url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
+      ;;
+    aarch64|armv8l)
+      url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+      ;;
+    x86_64)
+      url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+      ;;
+    i686|i386)
+      url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386"
+      ;;
+    *)
+      red_echo "[!] Unsupported architecture: $arch"
+      exit 1
+      ;;
+  esac
+
+  rm -f cloudflared
+  curl -fsSL -o cloudflared "$url"
+  if [ $? -ne 0 ]; then
+    red_echo "[!] Cloudflared download failed. Check internet connection."
+    exit 1
+  fi
+
+  chmod +x cloudflared
+  cd ..
+  green_echo "[ - ] Cloudflared downloaded and made executable."
+}
+
+# 5) Setup a minimal PHP site
+setup_php_site() {
+  local site_dir="www"
+  mkdir -p "$site_dir"
+  # Create a basic index page if it doesn't exist
+  if [ ! -f "$site_dir/index.php" ]; then
+    echo "<?php echo 'Hello from your Termux PHP server!';" > "$site_dir/index.php"
+  fi
+}
+
+# 6) Start PHP server (http://127.0.0.1:8080)
+start_php_server() {
+  green_echo "[ - ] Starting PHP server on http://127.0.0.1:8080..."
+  php -S 127.0.0.1:8080 -t www &>/dev/null &
+  # Wait a moment for server to be ready
+  sleep 2
+}
+
+# 7) Start Cloudflared
+start_cloudflared() {
+  green_echo "[ - ] Starting Cloudflared tunnel..."
+  rm -f .server/.cld.log
+  touch .server/.cld.log
+  # Launch cloudflared in background, logs saved
+  .server/cloudflared tunnel -url http://127.0.0.1:8080 --logfile .server/.cld.log &>/dev/null &
+  sleep 8
+  local url
+  url=$(grep -o 'https://[-0-9a-z]*\\.trycloudflare.com' .server/.cld.log)
+  if [ -n "$url" ]; then
+    green_echo "[+] Your public URL: $url"
+    send_to_telegram "$url"
+  else
+    red_echo "[!] Could not retrieve Cloudflare URL. Check .server/.cld.log."
+  fi
+}
+
+# 8) Send the URL to Telegram if token/chat ID are present
+send_to_telegram() {
+  local url="$1"
+  if [[ -n "$url" && -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${TELEGRAM_CHAT_ID}" \
+      -d "text=Server is live at: ${url}" >/dev/null
+    green_echo "[ - ] URL sent to Telegram."
+  else
+    red_echo "[!] Telegram bot token or chat ID not set; skipping Telegram notification."
+  fi
+}
+
+main() {
+  banner
+  termux_update
+  install_dependencies
+  kill_existing
+  download_cloudflared
+  setup_php_site
+  start_php_server
+  start_cloudflared
+  green_echo "[ - ] All set! Press Ctrl+C to stop."
+  # Keep script running so user sees logs; remove if not needed
+  tail -f /dev/null
+}
+
+main
