@@ -1,26 +1,26 @@
 #!/data/data/com.termux/files/usr/bin/bash
 __version__="1.0"
 
-# Colors
+# --- Colors ---
 GREEN="\033[32m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# Colored echo helpers
+# --- Color Echos ---
 green_echo() { echo -e "${GREEN}$1${RESET}"; }
-red_echo() { echo -e "${RED}$1${RESET}"; }
+red_echo()   { echo -e "${RED}$1${RESET}"; }
 
-# Graceful exit on Ctrl+C
+# --- Graceful Exit on Ctrl+C ---
 trap 'red_echo "[!] Script interrupted."; exit 1' SIGINT
 
-# Banner
 banner() {
-  green_echo "=========================================="
-  green_echo " Termux Cloudflared + PHP Installer v${__version__}"
-  green_echo "=========================================="
+  green_echo "=============================================="
+  green_echo " Cloudflared + PHP on Termux [Webroot: your_site]"
+  green_echo " v${__version__}"
+  green_echo "=============================================="
 }
 
-# 1) Update and upgrade packages
+# 1) Update Termux packages
 termux_update() {
   green_echo "[+] Updating Termux packages..."
   yes | pkg update
@@ -30,33 +30,34 @@ termux_update() {
 # 2) Install dependencies: php, curl, jq
 install_dependencies() {
   local packages=(php curl jq)
-  for p in "${packages[@]}"; do
-    if ! command -v "$p" &>/dev/null; then
-      green_echo "[+] Installing $p..."
-      yes | pkg install "$p"
+  for pkg_name in "${packages[@]}"; do
+    if ! command -v "$pkg_name" &>/dev/null; then
+      green_echo "[+] Installing $pkg_name..."
+      yes | pkg install "$pkg_name"
     fi
   done
-  green_echo "[+] All dependencies installed."
+  green_echo "[+] Dependencies installed."
 }
 
-# 3) Kill any existing php/cloudflared
+# 3) Kill existing php / cloudflared
 kill_existing() {
   local procs=(php cloudflared)
-  for prc in "${procs[@]}"; do
-    if pgrep "$prc" &>/dev/null; then
-      green_echo "[ - ] Killing existing $prc..."
-      pkill "$prc"
+  for p in "${procs[@]}"; do
+    if pgrep "$p" &>/dev/null; then
+      green_echo "[ - ] Killing existing $p..."
+      pkill "$p"
     fi
   done
 }
 
-# 4) Download the correct cloudflared for the detected arch
+# 4) Download cloudflared matching device architecture
 download_cloudflared() {
   mkdir -p .server
   cd .server || exit 1
 
-  green_echo "[ - ] Downloading cloudflared for your architecture..."
-  local arch=$(uname -m)
+  green_echo "[ - ] Downloading cloudflared..."
+  local arch
+  arch=$(uname -m)
   local url=""
   case "$arch" in
     arm|armv7l)
@@ -80,61 +81,49 @@ download_cloudflared() {
   rm -f cloudflared
   curl -fsSL -o cloudflared "$url"
   if [ $? -ne 0 ]; then
-    red_echo "[!] Cloudflared download failed. Check internet connection."
+    red_echo "[!] Failed to download cloudflared. Check your connection."
     exit 1
   fi
 
   chmod +x cloudflared
   cd ..
-  green_echo "[ - ] Cloudflared downloaded and made executable."
+  green_echo "[ - ] cloudflared is ready."
 }
 
-# 5) Setup a minimal PHP site
-setup_php_site() {
-  local site_dir="www"
-  mkdir -p "$site_dir"
-  # Create a basic index page if it doesn't exist
-  if [ ! -f "$site_dir/index.php" ]; then
-    echo "<?php echo 'Hello from your Termux PHP server!';" > "$site_dir/index.php"
+# 5) Create the webroot: your_site/
+setup_webroot() {
+  local webroot="your_site"
+  mkdir -p "$webroot"
+  # If index doesn't exist, create a small one
+  if [ ! -f "$webroot/index.php" ]; then
+    echo "<?php echo 'Hello from your_site!';" > "$webroot/index.php"
   fi
 }
 
-# 6) Start PHP server (http://127.0.0.1:8080)
+# 6) Start PHP on 127.0.0.1:8080 with your_site as root
 start_php_server() {
-  green_echo "[ - ] Starting PHP server on http://127.0.0.1:8080..."
-  php -S 127.0.0.1:8080 -t www &>/dev/null &
-  # Wait a moment for server to be ready
+  green_echo "[ - ] Starting PHP server on http://127.0.0.1:8080 (root: your_site/)..."
+  php -S 127.0.0.1:8080 -t your_site &>/dev/null &
   sleep 2
 }
 
-# 7) Start Cloudflared
+# 7) Start cloudflared & parse its output
 start_cloudflared() {
-  green_echo "[ - ] Starting Cloudflared tunnel..."
+  green_echo "[ - ] Launching cloudflared tunnel..."
   rm -f .server/.cld.log
   touch .server/.cld.log
-  # Launch cloudflared in background, logs saved
-  .server/cloudflared tunnel -url http://127.0.0.1:8080 --logfile .server/.cld.log &>/dev/null &
-  sleep 8
-  local url
-  url=$(grep -o 'https://[-0-9a-z]*\\.trycloudflare.com' .server/.cld.log)
-  if [ -n "$url" ]; then
-    green_echo "[+] Your public URL: $url"
-    send_to_telegram "$url"
-  else
-    red_echo "[!] Could not retrieve Cloudflare URL. Check .server/.cld.log."
-  fi
-}
 
-# 8) Send the URL to Telegram if token/chat ID are present
-send_to_telegram() {
-  local url="$1"
-  if [[ -n "$url" && -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-      -d "chat_id=${TELEGRAM_CHAT_ID}" \
-      -d "text=Server is live at: ${url}" >/dev/null
-    green_echo "[ - ] URL sent to Telegram."
+  # Run cloudflared in background, capturing logs
+  .server/cloudflared tunnel -url http://127.0.0.1:8080 2>&1 | tee .server/.cld.log &
+  sleep 10
+
+  local url
+  url=$(grep -Eo 'https://[a-zA-Z0-9._-]+\.trycloudflare\.com' .server/.cld.log | head -n 1)
+  if [ -n "$url" ]; then
+    green_echo "[+] Public URL: $url"
+    # If you want Telegram support, set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID, then call send_to_telegram "$url"
   else
-    red_echo "[!] Telegram bot token or chat ID not set; skipping Telegram notification."
+    red_echo "[!] Could not retrieve the Cloudflared URL. Check .server/.cld.log for errors."
   fi
 }
 
@@ -144,11 +133,10 @@ main() {
   install_dependencies
   kill_existing
   download_cloudflared
-  setup_php_site
+  setup_webroot
   start_php_server
   start_cloudflared
-  green_echo "[ - ] All set! Press Ctrl+C to stop."
-  # Keep script running so user sees logs; remove if not needed
+  green_echo "[ - ] Done. Press Ctrl+C to exit or run 'pkill php && pkill cloudflared' to stop."
   tail -f /dev/null
 }
 
